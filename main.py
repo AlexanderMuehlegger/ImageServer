@@ -57,7 +57,6 @@ class ImageFile(Resource):
         image = Image.query.get(id)
         if image is None:
             return {'Response' : '404: Das Bild mit der ID: %d konnte nicht gefunden werden!' % id}
-        notify_users()
         return image.getJson()
     def put(self, id):
         print(id)
