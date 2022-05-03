@@ -1,12 +1,28 @@
+from azure.cognitiveservices.vision.computervision import ComputerVisionClient
+from azure.cognitiveservices.vision.computervision.models import OperationStatusCodes
 from flask import Flask, request, render_template, jsonify
 from flask_restful import Api, Resource
+from msrest.authentication import CognitiveServicesCredentials
 from sqlalchemy import Column, Integer, Text, DateTime, create_engine, LargeBinary
 import paho.mqtt.client as mqtt
 import time
 
 from sqlalchemy.orm import declarative_base, sessionmaker, scoped_session
 
-import keys
+import ids, uuid, requests
+
+allowedLanguages = [
+    'en', 'de', 'it'
+]
+
+headers = {
+    'Ocp-Apim-Subscription-Key': ids.sub_key_transl,
+    'Ocp-Apim-Subscription-Region': ids.transl_location,
+    'Content-type': 'application/json',
+    'X-ClientTraceId': str(uuid.uuid4())
+}
+
+translation_url = ids.endpoint_translation + '/translate'
 
 app = Flask(__name__)
 api = Api(app)
@@ -20,8 +36,8 @@ Base.query = db_session.query_property()
 Base.metadata.create_all(bind=engine)
 
 client = mqtt.Client('RaspberryPi')
-client.username_pw_set(keys.username, keys.pw)
-client.connect(keys.ip, port=keys.port)
+client.username_pw_set(ids.username, ids.pw)
+client.connect(ids.ip, port=ids.port)
 
 @app.route("/")
 def index():
@@ -37,6 +53,8 @@ class Image(Base):
     Date = Column(Text)
     Imagename = Column(Text)
     Upload_folder = Column(Text)
+    ReadText = Column(Text)
+    Translation = Column(Text)
 
     def getJson(self):
         return {
@@ -46,11 +64,53 @@ class Image(Base):
             'Device': self.Device,
             'Date': self.Date,
             'Imagename': self.Imagename,
-            'UPLOAD_FOLDER' : self.Upload_folder
+            'UPLOAD_FOLDER' : self.Upload_folder,
+            'Text' : self.ReadText,
+            'Translation' : self.Translation
         }
 
 def notify_users():
     client.publish("foto/taken/dev0", "A new image has been uploaded!!!!")
+
+def translate(into, text):
+    if len(text) == 0:
+        return {'Response' : '500: No Text provided!'}
+
+    if into in allowedLanguages:
+        params = {
+            'api-version' : '3.0',
+            'to' : str(into)
+        }
+    body = [{
+        'text' : str(text)
+    }]
+    if params is not None:
+        result = requests.post(translation_url, params=params, headers=headers, json=body)
+        return result.json()
+
+def get_image_text(image):
+    text = []
+    computervision = ComputerVisionClient(ids.endpoint_vision, CognitiveServicesCredentials(ids.sub_key_vision))
+    response = computervision.read_in_stream(open(image, 'rb'), raw=True)
+
+    read_operation = response.headers['Operation-Location']
+    operation_id = read_operation.split("/")[-1]
+
+    while(True):
+        read_result = computervision.get_read_result(operation_id)
+        if read_result.status not in ['notStarted', "running"]:
+            break
+        time.sleep(1)
+
+    if read_result.status == OperationStatusCodes.succeeded:
+        for text_result in read_result.analyze_result.read_results:
+            for line in text_result.lines:
+                text.append(line.text)
+
+    if len(text) != 0:
+        return text
+
+    return {'Response' : 'No Text Detected!'}
 
 class ImageFile(Resource):
     def get(self, id):
@@ -60,8 +120,13 @@ class ImageFile(Resource):
         return image.getJson()
     def put(self, id):
         print(id)
+
+        text = get_image_text('.' + request.form['UPLOAD_FOLDER'] + '/' + request.form['Imagename'])
+        translation = translate('en', text)
+
         image = Image(Titel=request.form['Titel'], Description=request.form['Description'], Device=request.form['Device'],
-                      Date=request.form['Date'], Imagename=request.form['Imagename'], Upload_folder=request.form['UPLOAD_FOLDER'])
+                      Date=request.form['Date'], Imagename=request.form['Imagename'], Upload_folder=request.form['UPLOAD_FOLDER'],
+                      Translation={'Text' : str(translation)}, ReadText={'Text' : str(text)})
         print("DB access")
         db_session.add(image)
         db_session.flush()
